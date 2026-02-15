@@ -1,0 +1,268 @@
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { Resend } from "https://esm.sh/resend@2.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+
+const resend = new Resend(Deno.env.get("RESEND_API_KEY"));
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+};
+
+interface LoanNotificationRequest {
+  userId: string;
+  status: 'approved' | 'rejected';
+  loanAmount: number;
+  tenor: number;
+  interestRate: number;
+  rejectionReason?: string;
+  memberName?: string;
+  memberEmail?: string;
+}
+
+const formatCurrency = (amount: number): string => {
+  return new Intl.NumberFormat('id-ID', {
+    style: 'currency',
+    currency: 'IDR',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+  }).format(amount);
+};
+
+// Helper function to generate email header with optional logo
+const generateEmailHeader = (cooperativeName: string, logoBase64: string | null, title: string, bgColor: string) => {
+  const logoHtml = logoBase64 ? `
+    <img 
+      src="${logoBase64}" 
+      alt="${cooperativeName}" 
+      style="width: 80px; height: 80px; border-radius: 50%; object-fit: cover; margin-bottom: 15px; border: 3px solid rgba(255,255,255,0.3);"
+    />
+  ` : '';
+  
+  return `
+    <div style="background: ${bgColor}; padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+      ${logoHtml}
+      <h1 style="color: white; margin: 0; font-size: 24px;">${title}</h1>
+    </div>
+  `;
+};
+
+const handler = async (req: Request): Promise<Response> => {
+  console.log("send-loan-notification function called");
+  
+  // Handle CORS preflight requests
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const { 
+      userId, 
+      status, 
+      loanAmount,
+      tenor,
+      interestRate,
+      rejectionReason, 
+      memberName, 
+      memberEmail 
+    }: LoanNotificationRequest = await req.json();
+    
+    console.log(`Processing loan notification for user ${userId}, status: ${status}`);
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // If memberName and memberEmail are not provided, fetch from database
+    let name = memberName;
+    let email = memberEmail;
+    
+    if (!name || !email) {
+      const { data: profile, error } = await supabase
+        .from('profiles')
+        .select('name, email')
+        .eq('user_id', userId)
+        .single();
+      
+      if (error || !profile) {
+        console.error("Error fetching profile:", error);
+        return new Response(
+          JSON.stringify({ error: "Profile not found" }),
+          { status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        );
+      }
+      
+      name = profile.name;
+      email = profile.email;
+    }
+
+    // Fetch cooperative name and logo for email branding
+    const { data: coopSettings } = await supabase
+      .from('cooperative_settings')
+      .select('key, value')
+      .in('key', ['cooperative_name', 'cooperative_logo_base64']);
+    
+    const settingsMap: Record<string, string> = {};
+    coopSettings?.forEach((s: { key: string; value: string }) => {
+      settingsMap[s.key] = s.value;
+    });
+    
+    const cooperativeName = settingsMap['cooperative_name'] || 'Koperasi';
+    const logoBase64 = settingsMap['cooperative_logo_base64'] || null;
+
+    // Calculate monthly installment for approved loans
+    const monthlyPrincipal = Math.round(loanAmount / tenor);
+    const monthlyInterest = Math.round(loanAmount * interestRate);
+    const monthlyInstallment = monthlyPrincipal + monthlyInterest;
+
+    let subject: string;
+    let htmlContent: string;
+
+    if (status === 'approved') {
+      subject = `Selamat! Pengajuan Pinjaman Anda di ${cooperativeName} Telah Disetujui`;
+      const headerHtml = generateEmailHeader(cooperativeName, logoBase64, '🎉 Pinjaman Disetujui!', 'linear-gradient(135deg, #10b981 0%, #059669 100%)');
+      
+      htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        </head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+          ${headerHtml}
+          <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px; border: 1px solid #e5e7eb; border-top: none;">
+            <p style="font-size: 16px;">Halo <strong>${name}</strong>,</p>
+            <p>Kami dengan senang hati memberitahukan bahwa pengajuan pinjaman Anda di <strong>${cooperativeName}</strong> telah <span style="color: #10b981; font-weight: bold;">DISETUJUI</span>.</p>
+            
+            <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border: 1px solid #e5e7eb;">
+              <h3 style="margin-top: 0; color: #059669; border-bottom: 2px solid #10b981; padding-bottom: 10px;">Detail Pinjaman:</h3>
+              <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;">Jumlah Pinjaman</td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formatCurrency(loanAmount)}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;">Tenor</td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold;">${tenor} bulan</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;">Bunga per Bulan</td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold;">${(interestRate * 100).toFixed(1)}%</td>
+                </tr>
+                <tr style="border-top: 1px solid #e5e7eb;">
+                  <td style="padding: 12px 0; color: #059669; font-weight: bold;">Angsuran per Bulan</td>
+                  <td style="padding: 12px 0; text-align: right; font-weight: bold; color: #059669; font-size: 18px;">${formatCurrency(monthlyInstallment)}</td>
+                </tr>
+              </table>
+            </div>
+            
+            <div style="background: #ecfdf5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #10b981;">
+              <h3 style="margin-top: 0; color: #059669;">📋 Informasi Penting:</h3>
+              <ul style="margin: 0; padding-left: 20px; color: #065f46;">
+                <li>Dana pinjaman akan segera dicairkan ke rekening Anda</li>
+                <li>Angsuran pertama jatuh tempo 1 bulan setelah pencairan</li>
+                <li>Silakan bayar angsuran tepat waktu untuk menghindari denda</li>
+                <li>Cek jadwal angsuran lengkap di aplikasi</li>
+              </ul>
+            </div>
+            
+            <p>Terima kasih atas kepercayaan Anda kepada ${cooperativeName}!</p>
+            
+            <p style="margin-top: 30px; color: #6b7280; font-size: 14px;">
+              Salam hangat,<br>
+              <strong>Tim ${cooperativeName}</strong>
+            </p>
+          </div>
+          <div style="text-align: center; padding: 20px; color: #9ca3af; font-size: 12px;">
+            <p>Email ini dikirim secara otomatis. Mohon tidak membalas email ini.</p>
+          </div>
+        </body>
+        </html>
+      `;
+    } else {
+      subject = `Pemberitahuan Status Pengajuan Pinjaman di ${cooperativeName}`;
+      const headerHtml = generateEmailHeader(cooperativeName, logoBase64, 'Pemberitahuan Pengajuan Pinjaman', 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)');
+      
+      htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        </head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+          ${headerHtml}
+          <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px; border: 1px solid #e5e7eb; border-top: none;">
+            <p style="font-size: 16px;">Halo <strong>${name}</strong>,</p>
+            <p>Mohon maaf, kami harus memberitahukan bahwa pengajuan pinjaman Anda sebesar <strong>${formatCurrency(loanAmount)}</strong> di <strong>${cooperativeName}</strong> <span style="color: #ef4444; font-weight: bold;">belum dapat disetujui</span> saat ini.</p>
+            
+            ${rejectionReason ? `
+            <div style="background: #fef2f2; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #ef4444;">
+              <h3 style="margin-top: 0; color: #dc2626;">📝 Alasan Penolakan:</h3>
+              <p style="margin: 0;">${rejectionReason}</p>
+            </div>
+            ` : ''}
+            
+            <div style="background: #fffbeb; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
+              <h3 style="margin-top: 0; color: #d97706;">💡 Apa yang dapat Anda lakukan?</h3>
+              <ul style="margin: 0; padding-left: 20px; color: #92400e;">
+                <li>Tingkatkan saldo simpanan Anda terlebih dahulu</li>
+                <li>Ajukan dengan jumlah pinjaman yang lebih kecil</li>
+                <li>Pastikan tidak ada tunggakan angsuran sebelumnya</li>
+                <li>Hubungi pengurus koperasi untuk konsultasi</li>
+              </ul>
+            </div>
+            
+            <p>Anda dapat mengajukan pinjaman kembali setelah memenuhi persyaratan.</p>
+            
+            <p style="margin-top: 30px; color: #6b7280; font-size: 14px;">
+              Salam,<br>
+              <strong>Tim ${cooperativeName}</strong>
+            </p>
+          </div>
+          <div style="text-align: center; padding: 20px; color: #9ca3af; font-size: 12px;">
+            <p>Email ini dikirim secara otomatis. Mohon tidak membalas email ini.</p>
+          </div>
+        </body>
+        </html>
+      `;
+    }
+
+    if (!email) {
+      console.error("Email address not found");
+      return new Response(
+        JSON.stringify({ error: "Email address not found" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    console.log(`Sending ${status} loan email to ${email}`);
+    
+    const emailResponse = await resend.emails.send({
+      from: `${cooperativeName} <onboarding@resend.dev>`,
+      to: [email as string],
+      subject: subject,
+      html: htmlContent,
+    });
+
+    console.log("Email sent successfully:", emailResponse);
+
+    return new Response(JSON.stringify({ success: true, emailResponse }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ...corsHeaders },
+    });
+  } catch (error: any) {
+    console.error("Error in send-loan-notification function:", error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      }
+    );
+  }
+};
+
+serve(handler);
